@@ -56,7 +56,7 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory, make_layers, maybe_prefix)
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import Olmo3Config
-
+import json
 
 class Olmo2Attention(nn.Module):
     """
@@ -276,11 +276,48 @@ class Olmo2Model(nn.Module):
         self.config = vllm_config.model_config.hf_config
         assert isinstance(self.config, (Olmo2Config, Olmo3Config))
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            prefix=f"{prefix}.embed_tokens",
-        )
+        self.parallel_embedding_mapping_path = self.config.parallel_embedding_mapping_path
+        if self.parallel_embedding_mapping_path is not None:
+            print(f"Loading parallel embedding mapping from {self.parallel_embedding_mapping_path} for Olmo2Model.")
+            with open(self.parallel_embedding_mapping_path, "r", encoding="utf-8") as f:
+                self.original_parallel_embedding_mapping = json.load(f)
+                self.original_parallel_embedding_mapping = {int(k): int(v) for k, v in self.original_parallel_embedding_mapping.items()}
+                self.parallel_embedding_mapping = self.original_parallel_embedding_mapping.copy()
+            # map input_ids from config.vocab_size to config.vocab_size-len(parallel_embedding_mapping)
+            ids_to_shift = [0] * self.config.vocab_size
+            current_shift = 0
+            for i in range(self.config.vocab_size):
+                ids_to_shift[i] = current_shift
+                if i in self.original_parallel_embedding_mapping:
+                    current_shift += 1
+            for i in range(self.config.vocab_size):
+                if i not in self.original_parallel_embedding_mapping:
+                    self.parallel_embedding_mapping[i] = i - ids_to_shift[i]
+                else:
+                    self.parallel_embedding_mapping[i] = self.original_parallel_embedding_mapping[i] - ids_to_shift[self.original_parallel_embedding_mapping[i]]
+
+            self.register_buffer(
+                "mapping_tensor",
+                torch.tensor([self.parallel_embedding_mapping.get(i, i) for i in range(self.config.vocab_size)]),
+                persistent=False,
+            )
+
+            self.embed_tokens_parallel = VocabParallelEmbedding(
+                self.config.vocab_size - len(self.original_parallel_embedding_mapping),
+                self.config.hidden_size_shared,
+                prefix=f"{prefix}.embed_tokens_parallel",
+            )
+            self.embed_tokens = VocabParallelEmbedding(
+                self.config.vocab_size,
+                self.config.hidden_size-self.config.hidden_size_shared,
+                prefix=f"{prefix}.embed_tokens",
+            )
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                prefix=f"{prefix}.embed_tokens",
+            )
         self.start_layer, self.end_layer, self.layers = make_layers(
             self.config.num_hidden_layers,
             lambda prefix: Olmo2DecoderLayer(vllm_config=vllm_config,
@@ -311,7 +348,15 @@ class Olmo2Model(nn.Module):
             # Get embeddings of input.
             # shape: (batch_size, seq_len, d_model)
             else:
-                hidden_states = self.embed_tokens(input_ids)
+                if self.parallel_embedding_mapping_path is not None:
+                    # map input_ids to parallel vocabulary ids
+                    input_ids_parallel = self.mapping_tensor[input_ids]
+
+                    hidden_states = self.embed_tokens(input_ids)
+                    hidden_states_parallel = self.embed_tokens_parallel(input_ids_parallel)
+                    hidden_states = torch.cat([hidden_states_parallel, hidden_states], dim=-1)
+                else:
+                    hidden_states = self.embed_tokens(input_ids)
 
         else:
             assert intermediate_tensors is not None
@@ -397,13 +442,44 @@ class Olmo2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             self.lm_head = self.model.embed_tokens
         else:
             self.unpadded_vocab_size = config.vocab_size
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-                quant_config=vllm_config.quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
+            if self.config.align_unembedding:
+                print("Using aligned unembedding matrix in Olmo2ForCausalLM.")
+                with open(config.parallel_embedding_mapping_path, "r", encoding="utf-8") as f:
+                    self.original_parallel_embedding_mapping = json.load(f)
+                    self.original_parallel_embedding_mapping = {int(k): int(v) for k, v in self.original_parallel_embedding_mapping.items()}
+                    self.parallel_embedding_mapping = self.original_parallel_embedding_mapping.copy()
+                # map input_ids from config.vocab_size to config.vocab_size-len(parallel_embedding_mapping)
+                ids_to_shift = [0] * config.vocab_size
+                current_shift = 0
+                for i in range(config.vocab_size):
+                    ids_to_shift[i] = current_shift
+                    if i in self.original_parallel_embedding_mapping:
+                        current_shift += 1
+                for i in range(config.vocab_size):
+                    if i not in self.original_parallel_embedding_mapping:
+                        self.parallel_embedding_mapping[i] = i - ids_to_shift[i]
+                    else:
+                        self.parallel_embedding_mapping[i] = self.original_parallel_embedding_mapping[i] - ids_to_shift[self.original_parallel_embedding_mapping[i]]
+                self.lm_head_parallel = ParallelLMHead(
+                    config.vocab_size - len(self.original_parallel_embedding_mapping),
+                    config.hidden_size_shared,
+                    prefix=f"{prefix}.lm_head_parallel",
+                )
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size - config.hidden_size_shared,
+                    prefix=f"{prefix}.lm_head",
+                )
+                # create aligned unembedding expansion indices to expand the parallel lm head weights to full vocab size
+                ordered_aligned_vocab_mapping = dict(sorted(self.parallel_embedding_mapping.items(), key=lambda item: int(item[0])))
+                print("aligned_unembedding_expansion_indices shape:", len(ordered_aligned_vocab_mapping))
+                self.register_buffer("aligned_unembedding_expansion_indices", torch.tensor(list(ordered_aligned_vocab_mapping.values())), persistent=False)
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    prefix=f"{prefix}.lm_head",
+                )
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
@@ -427,6 +503,11 @@ class Olmo2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
         self,
         hidden_states: torch.Tensor,
     ) -> Optional[torch.Tensor]:
+        if self.config.align_unembedding:
+            logits_parallel = self.logits_processor(self.lm_head_parallel, hidden_states[..., :self.config.hidden_size_shared])
+            logits = self.logits_processor(self.lm_head, hidden_states[..., self.config.hidden_size_shared:])
+            # expand logits_parallel to full vocab size
+            return logits_parallel.index_select(-1, self.aligned_unembedding_expansion_indices) + logits
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
