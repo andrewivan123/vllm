@@ -277,6 +277,10 @@ class Olmo2Model(nn.Module):
         assert isinstance(self.config, (Olmo2Config, Olmo3Config))
 
         self.parallel_embedding_mapping_path = self.config.parallel_embedding_mapping_path
+        self.has_residual_dim = (
+            getattr(self.config, 'hidden_size_shared', None) is not None
+            and self.config.hidden_size_shared < self.config.hidden_size
+        )
         if self.parallel_embedding_mapping_path is not None:
             print(f"Loading parallel embedding mapping from {self.parallel_embedding_mapping_path} for Olmo2Model.")
             with open(self.parallel_embedding_mapping_path, "r", encoding="utf-8") as f:
@@ -307,11 +311,12 @@ class Olmo2Model(nn.Module):
                 self.config.hidden_size_shared,
                 prefix=f"{prefix}.embed_tokens_parallel",
             )
-            self.embed_tokens = VocabParallelEmbedding(
-                self.config.vocab_size,
-                self.config.hidden_size-self.config.hidden_size_shared,
-                prefix=f"{prefix}.embed_tokens",
-            )
+            if self.has_residual_dim:
+                self.embed_tokens = VocabParallelEmbedding(
+                    self.config.vocab_size,
+                    self.config.hidden_size-self.config.hidden_size_shared,
+                    prefix=f"{prefix}.embed_tokens",
+                )
         else:
             self.embed_tokens = VocabParallelEmbedding(
                 self.config.vocab_size,
@@ -352,9 +357,12 @@ class Olmo2Model(nn.Module):
                     # map input_ids to parallel vocabulary ids
                     input_ids_parallel = self.mapping_tensor[input_ids]
 
-                    hidden_states = self.embed_tokens(input_ids)
                     hidden_states_parallel = self.embed_tokens_parallel(input_ids_parallel)
-                    hidden_states = torch.cat([hidden_states_parallel, hidden_states], dim=-1)
+                    if self.has_residual_dim:
+                        hidden_states = self.embed_tokens(input_ids)
+                        hidden_states = torch.cat([hidden_states_parallel, hidden_states], dim=-1)
+                    else:
+                        hidden_states = hidden_states_parallel
                 else:
                     hidden_states = self.embed_tokens(input_ids)
 
@@ -442,6 +450,10 @@ class Olmo2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
             self.lm_head = self.model.embed_tokens
         else:
             self.unpadded_vocab_size = config.vocab_size
+            self.has_residual_dim = (
+                getattr(config, 'hidden_size_shared', None) is not None
+                and config.hidden_size_shared < config.hidden_size
+            )
             if self.config.align_unembedding:
                 print("Using aligned unembedding matrix in Olmo2ForCausalLM.")
                 with open(config.parallel_embedding_mapping_path, "r", encoding="utf-8") as f:
@@ -465,11 +477,12 @@ class Olmo2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
                     config.hidden_size_shared,
                     prefix=f"{prefix}.lm_head_parallel",
                 )
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size - config.hidden_size_shared,
-                    prefix=f"{prefix}.lm_head",
-                )
+                if self.has_residual_dim:
+                    self.lm_head = ParallelLMHead(
+                        config.vocab_size,
+                        config.hidden_size - config.hidden_size_shared,
+                        prefix=f"{prefix}.lm_head",
+                    )
                 # create aligned unembedding expansion indices to expand the parallel lm head weights to full vocab size
                 ordered_aligned_vocab_mapping = dict(sorted(self.parallel_embedding_mapping.items(), key=lambda item: int(item[0])))
                 print("aligned_unembedding_expansion_indices shape:", len(ordered_aligned_vocab_mapping))
@@ -505,9 +518,11 @@ class Olmo2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
     ) -> Optional[torch.Tensor]:
         if self.config.align_unembedding:
             logits_parallel = self.logits_processor(self.lm_head_parallel, hidden_states[..., :self.config.hidden_size_shared])
-            logits = self.logits_processor(self.lm_head, hidden_states[..., self.config.hidden_size_shared:])
-            # expand logits_parallel to full vocab size
-            return logits_parallel.index_select(-1, self.aligned_unembedding_expansion_indices) + logits
+            logits = logits_parallel.index_select(-1, self.aligned_unembedding_expansion_indices)
+            if self.has_residual_dim:
+                logits_residual = self.logits_processor(self.lm_head, hidden_states[..., self.config.hidden_size_shared:])
+                logits = logits + logits_residual
+            return logits
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
